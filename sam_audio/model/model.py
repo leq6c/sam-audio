@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
-from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
 from sam_audio.model.align import AlignModalities
@@ -15,9 +14,18 @@ from sam_audio.model.codec import DACVAE
 from sam_audio.model.config import SAMAudioConfig
 from sam_audio.model.text_encoder import T5TextEncoder
 from sam_audio.model.transformer import DiT
-from sam_audio.model.vision_encoder import PerceptionEncoder
 from sam_audio.processor import Batch
-from sam_audio.ranking import create_ranker
+
+try:
+    from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
+except ImportError:
+    PEAudioFrame = None
+    PEAudioFrameTransform = None
+
+try:
+    from sam_audio.model.vision_encoder import PerceptionEncoder
+except ImportError:
+    PerceptionEncoder = None
 
 DFLT_ODE_OPT = {"method": "midpoint", "options": {"step_size": 2 / 32}}
 
@@ -78,9 +86,11 @@ class SAMAudio(BaseModel):
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
+        self.config = cfg
         self.audio_codec = DACVAE(cfg.audio_codec)
         self.text_encoder = T5TextEncoder(cfg.text_encoder)
-        self.vision_encoder = PerceptionEncoder(cfg.vision_encoder)
+        self.vision_encoder = None
+        self.vision_encoder_dim = cfg.vision_encoder.dim
         self.transformer = DiT(cfg.transformer)
         self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
         self.align_masked_video = AlignModalities(
@@ -91,19 +101,61 @@ class SAMAudio(BaseModel):
         )
         self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
-        self.visual_ranker = create_ranker(cfg.visual_ranker)
-        self.text_ranker = create_ranker(cfg.text_ranker)
+        self.visual_ranker = None
+        self.text_ranker = None
+        self._visual_ranker_cfg = cfg.visual_ranker
+        self._text_ranker_cfg = cfg.text_ranker
         if cfg.span_predictor is not None:
-            self.span_predictor = PEAudioFrame.from_config(
-                cfg.span_predictor, pretrained=True
-            )
-            self.span_predictor_transform = PEAudioFrameTransform.from_config(
-                cfg.span_predictor
-            )
+            self._span_predictor_id = cfg.span_predictor
+            self.span_predictor = None
+            self.span_predictor_transform = None
+        else:
+            self._span_predictor_id = None
 
     @property
     def sample_rate(self):
         return self.audio_codec.sample_rate
+
+    def _ensure_vision_encoder(self):
+        if self.vision_encoder is None:
+            if PerceptionEncoder is None:
+                raise ImportError(
+                    "Perception Models is required for visual prompting, but it is not installed."
+                )
+            self.vision_encoder = PerceptionEncoder(self.config.vision_encoder).to(
+                self.device()
+            )
+        return self.vision_encoder
+
+    def _ensure_span_predictor(self):
+        if self._span_predictor_id is None:
+            return None
+        if self.span_predictor is None or self.span_predictor_transform is None:
+            if PEAudioFrame is None or PEAudioFrameTransform is None:
+                raise ImportError(
+                    "PE-AV is required for automatic span prediction, but it is not installed."
+                )
+            self.span_predictor = PEAudioFrame.from_config(
+                self._span_predictor_id, pretrained=True
+            ).to(self.device())
+            self.span_predictor_transform = PEAudioFrameTransform.from_config(
+                self._span_predictor_id
+            )
+        return self.span_predictor
+
+    def _ensure_visual_ranker(self):
+        if self.visual_ranker is None and self._visual_ranker_cfg is not None:
+            from sam_audio.ranking import create_ranker
+
+            self.visual_ranker = create_ranker(self._visual_ranker_cfg)
+        return self.visual_ranker
+
+    def _ensure_text_ranker(self):
+        if self.text_ranker is None and self._text_ranker_cfg is not None:
+            from sam_audio.ranking import create_ranker
+
+            self.text_ranker = create_ranker(self._text_ranker_cfg)
+        return self.text_ranker
 
     def align_inputs(
         self,
@@ -186,9 +238,9 @@ class SAMAudio(BaseModel):
     def _get_video_features(self, video, audio_features):
         B, T, _ = audio_features.shape
         if video is None:
-            return audio_features.new_zeros(B, self.vision_encoder.dim, T)
+            return audio_features.new_zeros(B, self.vision_encoder_dim, T)
         else:
-            return self.vision_encoder(video).transpose(1, 2)
+            return self._ensure_vision_encoder()(video).transpose(1, 2)
 
     def _repeat_for_reranking(self, tensor, candidates):
         if candidates > 1:
@@ -231,6 +283,7 @@ class SAMAudio(BaseModel):
     def predict_spans(
         self, batch: Batch, audio_features: torch.Tensor, audio_pad_mask: torch.Tensor
     ) -> Batch:
+        self._ensure_span_predictor()
         input = self.span_predictor_transform(text=batch.descriptions).to(
             audio_features.device
         )
@@ -306,7 +359,7 @@ class SAMAudio(BaseModel):
         if (
             reranking_candidates > 1
             and batch.masked_video is not None
-            and self.visual_ranker is not None
+            and self._ensure_visual_ranker() is not None
         ):
             scores = self.visual_ranker(
                 extracted_audio=target_wavs,
@@ -314,7 +367,7 @@ class SAMAudio(BaseModel):
                 sample_rate=self.audio_codec.sample_rate,
             )
             idxs = scores.argmax(dim=1)
-        elif reranking_candidates > 1 and self.text_ranker is not None:
+        elif reranking_candidates > 1 and self._ensure_text_ranker() is not None:
             input_audio = [
                 audio[:, :size].expand(reranking_candidates, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
@@ -344,19 +397,23 @@ class SAMAudio(BaseModel):
         return result
 
     def load_state_dict(self, state_dict, strict=True):
+        missing_keys, unexpected_keys = super().load_state_dict(
+            state_dict, strict=False
+        )
         if strict:
-            missing_keys, unexpected_keys = super().load_state_dict(
-                state_dict, strict=False
-            )
-            # We load this directly from HF, not in checkpoint
+            # These modules are loaded separately from HF or created lazily.
             skip_regex = re.compile(
-                "(^text_encoder|^visual_ranker|^text_ranker|^span_predictor)"
+                "(^text_encoder|^vision_encoder|^visual_ranker|^text_ranker|^span_predictor)"
             )
             missing_keys = [x for x in missing_keys if not re.search(skip_regex, x)]
+            unexpected_keys = [
+                x for x in unexpected_keys if not re.search(skip_regex, x)
+            ]
             if len(missing_keys) > 0 or len(unexpected_keys) > 0:
                 raise RuntimeError(
                     f"Missing keys: {missing_keys}, unexpected_keys: {unexpected_keys}"
                 )
+        return missing_keys, unexpected_keys
 
 
 __all__ = ["SAMAudio"]

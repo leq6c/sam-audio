@@ -57,6 +57,10 @@ lint.ignore = [
 Homepage = "https://github.com/facebookresearch/sam-audio"
 Repository = "https://github.com/facebookresearch/sam-audio"
 
+[project.scripts]
+sam-audio-prepare-speech-manifest = "sam_audio.finetune.prepare_speech_manifest:main"
+sam-audio-train-lora = "sam_audio.finetune.train_lora:main"
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
