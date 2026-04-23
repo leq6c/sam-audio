@@ -73,14 +73,14 @@ The trainer saves:
 ## Included Sample Dataset
 
 The workspace includes a minimal smoke-test dataset in
-[/Users/leq6c/Projects/oto/speech-separation/sample_dataset](/Users/leq6c/Projects/oto/speech-separation/sample_dataset/README.md).
+[../sample_dataset](../sample_dataset/README.md).
 
 Use it with:
 
 ```bash
 sam-audio-train-lora \
-  --train-json /Users/leq6c/Projects/oto/speech-separation/sample_dataset/train.json \
-  --eval-json /Users/leq6c/Projects/oto/speech-separation/sample_dataset/eval.json \
+  --train-json ../sample_dataset/train.json \
+  --eval-json ../sample_dataset/eval.json \
   --checkpoint-path facebook/sam-audio-small \
   --output-dir /tmp/sam-audio-sample-lora \
   --batch-size 1 \
