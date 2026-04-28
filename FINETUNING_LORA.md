@@ -49,6 +49,31 @@ sam-audio-train-lora \
 ```
 
 By default, LoRA is applied to all `nn.Linear` layers under `transformer`.
+You can enable `rsLoRA` with `--use-rslora`, which switches the adapter scaling
+from `alpha / r` to `alpha / sqrt(r)`.
+
+Validation can now be configured independently from training:
+
+- `--eval-batch-size`: validation batch size
+- `--eval-num-workers`: validation dataloader workers
+- `--eval-cache {none,cpu,gpu}`: cache frozen validation features once and reuse them
+
+For large validation sets, this is the recommended pattern:
+
+```bash
+sam-audio-train-lora \
+  --train-json /path/to/train.json \
+  --eval-json /path/to/valid.json \
+  --checkpoint-path facebook/sam-audio-small \
+  --output-dir /path/to/output \
+  --batch-size 1 \
+  --eval-batch-size 4 \
+  --num-workers 4 \
+  --eval-num-workers 8 \
+  --eval-cache cpu \
+  --epochs 3 \
+  --learning-rate 1e-4
+```
 
 You can narrow this with:
 
@@ -61,14 +86,63 @@ sam-audio-train-lora \
   --lora-targets wq,wk,wv,wo
 ```
 
+To train with rank-stabilized LoRA:
+
+```bash
+sam-audio-train-lora \
+  --train-json /path/to/train.json \
+  --checkpoint-path facebook/sam-audio-small \
+  --output-dir /path/to/output \
+  --lora-r 64 \
+  --lora-alpha 32 \
+  --use-rslora
+```
+
 The trainer saves:
 
 - `train_args.json`
+- `train_metrics.jsonl`
+- `eval_metrics.jsonl` (when `--eval-json` is provided)
 - `summary.json`
+- `best/adapter_config.json` and `best/adapter_model.pt` when eval is enabled
 - `final/adapter_config.json`
 - `final/adapter_model.pt`
 
 `adapter_model.pt` contains only LoRA weights.
+`train_metrics.jsonl` stores one JSON record per optimizer step, which is useful for
+plotting loss curves after training.
+
+## Comparison Export
+
+To compare the base checkpoint and a trained LoRA adapter, run:
+
+```bash
+sam-audio-compare-lora \
+  --json /path/to/eval.jsonl \
+  --checkpoint-path /path/to/checkpoint \
+  --adapter-dir /path/to/output/final \
+  --output-dir /path/to/comparison
+```
+
+This command scans the full dataset to score every sample, then exports two
+comparison directories:
+
+- `first/`
+- `best/`
+
+Each directory contains:
+
+- `mixture.wav`
+- `groundtruth_target.wav`
+- `groundtruth_residual.wav`
+- `base_target.wav`
+- `base_residual.wav`
+- `lora_target.wav`
+- `lora_residual.wav`
+- `report.json`
+
+`index.json` stores the full metric table plus the selected `first` and `best`
+sample reports.
 
 ## Included Sample Dataset
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import random
 import time
 from contextlib import nullcontext
@@ -23,6 +24,8 @@ from sam_audio.finetune.lora import (
     save_lora_adapter,
 )
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -37,6 +40,27 @@ def parse_args():
     parser.add_argument("--sample-rate", type=int, default=48_000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=0,
+        help="Validation batch size. Defaults to --batch-size when set to 0.",
+    )
+    parser.add_argument(
+        "--eval-num-workers",
+        type=int,
+        default=-1,
+        help="Validation worker count. Defaults to --num-workers when set to -1.",
+    )
+    parser.add_argument(
+        "--eval-cache",
+        choices=["none", "cpu", "gpu"],
+        default="cpu",
+        help=(
+            "Cache frozen validation features once and reuse them for later evals. "
+            "'cpu' is the safest default."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
@@ -49,6 +73,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument(
+        "--use-rslora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use rank-stabilized LoRA scaling (alpha / sqrt(r)) instead of alpha / r.",
+    )
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--lora-prefixes",
@@ -115,6 +145,53 @@ def set_frozen_modules_eval(model: SAMAudio):
             module.eval()
 
 
+def append_jsonl_line(file_obj, payload: dict):
+    file_obj.write(json.dumps(payload, sort_keys=True) + "\n")
+    file_obj.flush()
+
+
+def make_dataloader(
+    dataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    collate_fn,
+    pin_memory: bool,
+):
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+
+
+def cache_tensor(value: Optional[torch.Tensor], cache_device: torch.device):
+    if value is None:
+        return None
+    value = value.detach()
+    if cache_device.type == "cpu":
+        return value.cpu()
+    return value.to(cache_device)
+
+
+def move_tensor(value: Optional[torch.Tensor], device: torch.device):
+    if value is None:
+        return None
+    return value.to(device, non_blocking=True)
+
+
+def eval_cache_supported(adapted_modules: list[str]) -> bool:
+    forbidden_prefixes = ("audio_codec", "text_encoder", "vision_encoder")
+    return not any(
+        module_name.startswith(forbidden_prefixes) for module_name in adapted_modules
+    )
+
+
 def masked_mse_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -161,9 +238,80 @@ def compute_flow_matching_loss(
     )
 
 
-def evaluate(
+def compute_cached_flow_matching_loss(
+    model: SAMAudio,
+    cached_batch: dict,
+    device: torch.device,
+) -> torch.Tensor:
+    forward_args = {
+        key: move_tensor(value, device)
+        for key, value in cached_batch["forward_args"].items()
+    }
+    clean_features = move_tensor(cached_batch["clean_features"], device)
+    audio_pad_mask = move_tensor(cached_batch["audio_pad_mask"], device)
+
+    noise = torch.randn_like(clean_features)
+    time = torch.rand(clean_features.size(0), device=device, dtype=clean_features.dtype)
+    noisy_audio = (
+        (1.0 - time[:, None, None]) * noise + time[:, None, None] * clean_features
+    )
+    velocity_target = clean_features - noise
+
+    prediction = model.forward(
+        noisy_audio=noisy_audio,
+        time=time,
+        **forward_args,
+    )
+    return masked_mse_loss(
+        prediction=prediction,
+        target=velocity_target,
+        mask=audio_pad_mask,
+    )
+
+
+def build_eval_cache(
     model: SAMAudio,
     dataloader: DataLoader,
+    device: torch.device,
+    cache_mode: str,
+) -> list[dict]:
+    cache_device = torch.device("cpu" if cache_mode == "cpu" else device.type)
+    model.eval()
+    set_frozen_modules_eval(model)
+
+    cached_batches = []
+    with torch.no_grad():
+        for batch_dict in dataloader:
+            input_batch = batch_dict["input_batch"].to(device)
+            target_audio = batch_dict["target_audio"].to(device, non_blocking=True)
+            residual_audio = batch_dict["residual_audio"].to(device, non_blocking=True)
+
+            forward_args = {
+                key: cache_tensor(value, cache_device)
+                for key, value in model._get_forward_args(input_batch).items()
+            }
+            target_features = model.audio_codec(target_audio)
+            residual_features = model.audio_codec(residual_audio)
+            clean_features = torch.cat(
+                [target_features, residual_features], dim=1
+            ).transpose(1, 2)
+
+            cached_batches.append(
+                {
+                    "forward_args": forward_args,
+                    "clean_features": cache_tensor(clean_features, cache_device),
+                    "audio_pad_mask": cache_tensor(
+                        input_batch.audio_pad_mask, cache_device
+                    ),
+                }
+            )
+    return cached_batches
+
+
+def evaluate(
+    model: SAMAudio,
+    dataloader: Optional[DataLoader],
+    cached_batches: Optional[list[dict]],
     device: torch.device,
     dtype_name: str,
 ) -> float:
@@ -173,11 +321,21 @@ def evaluate(
     total_loss = 0.0
     total_batches = 0
     with torch.no_grad():
-        for batch_dict in dataloader:
-            with choose_autocast(device, dtype_name):
-                loss = compute_flow_matching_loss(model, batch_dict, device)
-            total_loss += float(loss.item())
-            total_batches += 1
+        if cached_batches is not None:
+            for cached_batch in cached_batches:
+                with choose_autocast(device, dtype_name):
+                    loss = compute_cached_flow_matching_loss(
+                        model, cached_batch, device
+                    )
+                total_loss += float(loss.item())
+                total_batches += 1
+        else:
+            assert dataloader is not None
+            for batch_dict in dataloader:
+                with choose_autocast(device, dtype_name):
+                    loss = compute_flow_matching_loss(model, batch_dict, device)
+                total_loss += float(loss.item())
+                total_batches += 1
     return total_loss / max(total_batches, 1)
 
 
@@ -202,22 +360,27 @@ def main():
         if args.eval_json is not None
         else None
     )
+    eval_batch_size = args.batch_size if args.eval_batch_size <= 0 else args.eval_batch_size
+    eval_num_workers = args.num_workers if args.eval_num_workers < 0 else args.eval_num_workers
 
     collate_fn = partial(collate_json_separation_samples, processor=processor)
-    train_loader = DataLoader(
+    pin_memory = device.type == "cuda"
+    train_loader = make_dataloader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
+        pin_memory=pin_memory,
     )
     eval_loader = (
-        DataLoader(
+        make_dataloader(
             eval_dataset,
-            batch_size=args.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=eval_num_workers,
             collate_fn=collate_fn,
+            pin_memory=pin_memory,
         )
         if eval_dataset is not None
         else None
@@ -233,6 +396,7 @@ def main():
         rank=args.lora_r,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
+        use_rslora=args.use_rslora,
         prefixes=prefixes,
         target_names=targets,
     )
@@ -253,6 +417,25 @@ def main():
     )
 
     trainable_count, total_count = count_trainable_parameters(model)
+    eval_cache_reason = None
+    use_eval_cache = (
+        eval_loader is not None
+        and args.eval_cache != "none"
+        and eval_cache_supported(adapted_modules)
+    )
+    if eval_loader is None:
+        eval_cache_reason = "no_eval_dataset"
+    elif args.eval_cache == "none":
+        eval_cache_reason = "disabled"
+    elif not eval_cache_supported(adapted_modules):
+        eval_cache_reason = "unsupported_adapted_modules"
+    else:
+        eval_cache_reason = args.eval_cache
+    eval_cached_batches = (
+        build_eval_cache(model, eval_loader, device, args.eval_cache)
+        if use_eval_cache
+        else None
+    )
     with open(args.output_dir / "train_args.json", "w") as fout:
         json.dump(vars(args), fout, indent=2, sort_keys=True, default=str)
 
@@ -262,6 +445,11 @@ def main():
                 "device": str(device),
                 "train_records": len(train_dataset),
                 "eval_records": len(eval_dataset) if eval_dataset is not None else 0,
+                "eval_batch_size": eval_batch_size,
+                "eval_num_workers": eval_num_workers,
+                "eval_cache": args.eval_cache if use_eval_cache else "none",
+                "eval_cache_reason": eval_cache_reason,
+                "use_rslora": args.use_rslora,
                 "adapted_modules": len(adapted_modules),
                 "trainable_parameters": trainable_count,
                 "total_parameters": total_count,
@@ -270,98 +458,198 @@ def main():
         )
     )
 
-    global_step = 0
-    accumulated_batches = 0
-    optimizer.zero_grad(set_to_none=True)
-    start_time = time.time()
+    train_metrics_path = args.output_dir / "train_metrics.jsonl"
+    eval_metrics_path = args.output_dir / "eval_metrics.jsonl"
 
-    for epoch in range(args.epochs):
-        model.train()
-        set_frozen_modules_eval(model)
+    train_metrics_fout = open(train_metrics_path, "w")
+    eval_metrics_fout = open(eval_metrics_path, "w") if eval_loader is not None else None
+    try:
+        global_step = 0
+        accumulated_batches = 0
+        optimizer.zero_grad(set_to_none=True)
+        start_time = time.time()
+        step_loss_sum = 0.0
+        step_loss_batches = 0
+        best_eval_loss = None
 
-        running_loss = 0.0
-        running_batches = 0
-        for batch_idx, batch_dict in enumerate(train_loader, start=1):
-            with choose_autocast(device, args.dtype):
-                loss = compute_flow_matching_loss(model, batch_dict, device)
-                scaled_loss = loss / args.grad_accum_steps
+        for epoch in range(args.epochs):
+            model.train()
+            set_frozen_modules_eval(model)
 
-            scaler.scale(scaled_loss).backward()
-            running_loss += float(loss.item())
-            running_batches += 1
-            accumulated_batches += 1
+            running_loss = 0.0
+            running_batches = 0
+            for batch_idx, batch_dict in enumerate(train_loader, start=1):
+                with choose_autocast(device, args.dtype):
+                    loss = compute_flow_matching_loss(model, batch_dict, device)
+                    scaled_loss = loss / args.grad_accum_steps
 
-            if accumulated_batches % args.grad_accum_steps == 0:
-                if args.grad_clip_norm > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        trainable_params, max_norm=args.grad_clip_norm
-                    )
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                accumulated_batches = 0
+                scaler.scale(scaled_loss).backward()
+                loss_value = float(loss.item())
+                running_loss += loss_value
+                running_batches += 1
+                step_loss_sum += loss_value
+                step_loss_batches += 1
+                accumulated_batches += 1
 
-                if global_step % args.log_every == 0:
-                    elapsed = time.time() - start_time
-                    avg_loss = running_loss / max(running_batches, 1)
-                    print(
-                        json.dumps(
-                            {
-                                "epoch": epoch + 1,
-                                "step": global_step,
-                                "train_loss": round(avg_loss, 6),
-                                "elapsed_sec": round(elapsed, 1),
-                            }
+                if accumulated_batches % args.grad_accum_steps == 0:
+                    if args.grad_clip_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            trainable_params, max_norm=args.grad_clip_norm
                         )
-                    )
-                    running_loss = 0.0
-                    running_batches = 0
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    accumulated_batches = 0
 
-                if args.eval_every > 0 and eval_loader is not None:
-                    if global_step % args.eval_every == 0:
-                        eval_loss = evaluate(model, eval_loader, device, args.dtype)
+                    elapsed = time.time() - start_time
+                    step_loss = step_loss_sum / max(step_loss_batches, 1)
+                    append_jsonl_line(
+                        train_metrics_fout,
+                        {
+                            "event": "train_step",
+                            "epoch": epoch + 1,
+                            "step": global_step,
+                            "batch_idx": batch_idx,
+                            "grad_accum_batches": step_loss_batches,
+                            "train_loss": round(step_loss, 6),
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "elapsed_sec": round(elapsed, 1),
+                        },
+                    )
+                    step_loss_sum = 0.0
+                    step_loss_batches = 0
+
+                    if global_step % args.log_every == 0:
+                        avg_loss = running_loss / max(running_batches, 1)
                         print(
                             json.dumps(
                                 {
+                                    "epoch": epoch + 1,
                                     "step": global_step,
-                                    "eval_loss": round(eval_loss, 6),
+                                    "train_loss": round(avg_loss, 6),
+                                    "elapsed_sec": round(elapsed, 1),
                                 }
                             )
                         )
-                        model.train()
-                        set_frozen_modules_eval(model)
+                        running_loss = 0.0
+                        running_batches = 0
 
-                if args.save_every > 0 and global_step % args.save_every == 0:
-                    save_lora_adapter(
-                        model,
-                        args.output_dir / f"step-{global_step}",
-                        checkpoint_path=args.checkpoint_path,
-                        module_names=adapted_modules,
-                        rank=args.lora_r,
-                        alpha=args.lora_alpha,
-                        dropout=args.lora_dropout,
-                    )
+                    if args.eval_every > 0 and eval_loader is not None:
+                        if global_step % args.eval_every == 0:
+                            eval_loss = evaluate(
+                                model,
+                                eval_loader,
+                                eval_cached_batches,
+                                device,
+                                args.dtype,
+                            )
+                            eval_payload = {
+                                "event": "eval_step",
+                                "epoch": epoch + 1,
+                                "step": global_step,
+                                "eval_loss": round(eval_loss, 6),
+                                "elapsed_sec": round(time.time() - start_time, 1),
+                            }
+                            print(json.dumps({"step": global_step, "eval_loss": round(eval_loss, 6)}))
+                            append_jsonl_line(eval_metrics_fout, eval_payload)
+                            if best_eval_loss is None or eval_loss < best_eval_loss:
+                                best_eval_loss = eval_loss
+                                save_lora_adapter(
+                                    model,
+                                    args.output_dir / "best",
+                                    checkpoint_path=args.checkpoint_path,
+                                    module_names=adapted_modules,
+                                    rank=args.lora_r,
+                                    alpha=args.lora_alpha,
+                                    dropout=args.lora_dropout,
+                                    use_rslora=args.use_rslora,
+                                )
+                            model.train()
+                            set_frozen_modules_eval(model)
 
-                if args.max_steps > 0 and global_step >= args.max_steps:
-                    break
+                    if args.save_every > 0 and global_step % args.save_every == 0:
+                        save_lora_adapter(
+                            model,
+                            args.output_dir / f"step-{global_step}",
+                            checkpoint_path=args.checkpoint_path,
+                            module_names=adapted_modules,
+                            rank=args.lora_r,
+                            alpha=args.lora_alpha,
+                            dropout=args.lora_dropout,
+                            use_rslora=args.use_rslora,
+                        )
 
-        if args.max_steps > 0 and global_step >= args.max_steps:
-            break
+                    if args.max_steps > 0 and global_step >= args.max_steps:
+                        break
 
-    if accumulated_batches > 0 and (args.max_steps <= 0 or global_step < args.max_steps):
-        if args.grad_clip_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        global_step += 1
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                break
 
-    final_eval = None
-    if eval_loader is not None:
-        final_eval = evaluate(model, eval_loader, device, args.dtype)
+        if accumulated_batches > 0 and (
+            args.max_steps <= 0 or global_step < args.max_steps
+        ):
+            if args.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    trainable_params, max_norm=args.grad_clip_norm
+                )
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+
+            elapsed = time.time() - start_time
+            step_loss = step_loss_sum / max(step_loss_batches, 1)
+            append_jsonl_line(
+                train_metrics_fout,
+                {
+                    "event": "train_step",
+                    "epoch": args.epochs,
+                    "step": global_step,
+                    "batch_idx": None,
+                    "grad_accum_batches": step_loss_batches,
+                    "train_loss": round(step_loss, 6),
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "elapsed_sec": round(elapsed, 1),
+                },
+            )
+
+        final_eval = None
+        if eval_loader is not None:
+            final_eval = evaluate(
+                model,
+                eval_loader,
+                eval_cached_batches,
+                device,
+                args.dtype,
+            )
+            append_jsonl_line(
+                eval_metrics_fout,
+                {
+                    "event": "eval_final",
+                    "step": global_step,
+                    "eval_loss": round(final_eval, 6),
+                    "elapsed_sec": round(time.time() - start_time, 1),
+                },
+            )
+            if best_eval_loss is None or final_eval < best_eval_loss:
+                best_eval_loss = final_eval
+                save_lora_adapter(
+                    model,
+                    args.output_dir / "best",
+                    checkpoint_path=args.checkpoint_path,
+                    module_names=adapted_modules,
+                    rank=args.lora_r,
+                    alpha=args.lora_alpha,
+                    dropout=args.lora_dropout,
+                    use_rslora=args.use_rslora,
+                )
+    finally:
+        train_metrics_fout.close()
+        if eval_metrics_fout is not None:
+            eval_metrics_fout.close()
 
     save_lora_adapter(
         model,
@@ -371,12 +659,14 @@ def main():
         rank=args.lora_r,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
+        use_rslora=args.use_rslora,
     )
 
     summary = {
         "final_step": global_step,
         "train_seconds": round(time.time() - start_time, 1),
         "final_eval_loss": None if final_eval is None else round(final_eval, 6),
+        "best_eval_loss": None if best_eval_loss is None else round(best_eval_loss, 6),
         "adapter_dir": str(args.output_dir / "final"),
     }
     with open(args.output_dir / "summary.json", "w") as fout:

@@ -236,9 +236,8 @@ class SAMAudio(BaseModel):
         return torch.cat([audio_features, audio_features], dim=2)
 
     def _get_video_features(self, video, audio_features):
-        B, T, _ = audio_features.shape
         if video is None:
-            return audio_features.new_zeros(B, self.vision_encoder_dim, T)
+            return None
         else:
             return self._ensure_vision_encoder()(video).transpose(1, 2)
 

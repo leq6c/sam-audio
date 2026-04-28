@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -13,6 +14,7 @@ class LoRALinear(nn.Module):
         rank: int,
         alpha: float,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
         if rank <= 0:
@@ -21,10 +23,19 @@ class LoRALinear(nn.Module):
         self.base_layer = base_layer
         self.rank = rank
         self.alpha = alpha
-        self.scaling = alpha / rank
+        self.use_rslora = use_rslora
+        self.scaling = alpha / math.sqrt(rank) if use_rslora else alpha / rank
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.lora_down = nn.Linear(base_layer.in_features, rank, bias=False)
-        self.lora_up = nn.Linear(rank, base_layer.out_features, bias=False)
+        layer_kwargs = {
+            "device": base_layer.weight.device,
+            "dtype": base_layer.weight.dtype,
+        }
+        self.lora_down = nn.Linear(
+            base_layer.in_features, rank, bias=False, **layer_kwargs
+        )
+        self.lora_up = nn.Linear(
+            rank, base_layer.out_features, bias=False, **layer_kwargs
+        )
 
         nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
         nn.init.zeros_(self.lora_up.weight)
@@ -95,6 +106,7 @@ def apply_lora_to_module_names(
     rank: int,
     alpha: float,
     dropout: float = 0.0,
+    use_rslora: bool = False,
 ) -> list[str]:
     applied = []
     for module_name in module_names:
@@ -114,6 +126,7 @@ def apply_lora_to_module_names(
                 rank=rank,
                 alpha=alpha,
                 dropout=dropout,
+                use_rslora=use_rslora,
             ),
         )
         applied.append(module_name)
@@ -125,6 +138,7 @@ def apply_lora(
     rank: int,
     alpha: float,
     dropout: float = 0.0,
+    use_rslora: bool = False,
     prefixes: Optional[Iterable[str]] = None,
     target_names: Optional[Iterable[str]] = None,
 ) -> list[str]:
@@ -139,6 +153,7 @@ def apply_lora(
         rank=rank,
         alpha=alpha,
         dropout=dropout,
+        use_rslora=use_rslora,
     )
 
 
@@ -171,6 +186,7 @@ def save_lora_adapter(
     rank: int,
     alpha: float,
     dropout: float,
+    use_rslora: bool,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +197,7 @@ def save_lora_adapter(
         "rank": rank,
         "alpha": alpha,
         "dropout": dropout,
+        "use_rslora": use_rslora,
     }
     with open(output_dir / "adapter_config.json", "w") as fout:
         json.dump(config, fout, indent=2, sort_keys=True)
@@ -203,6 +220,7 @@ def load_lora_adapter(
         rank=int(config["rank"]),
         alpha=float(config["alpha"]),
         dropout=float(config["dropout"]),
+        use_rslora=bool(config.get("use_rslora", False)),
     )
     state = torch.load(adapter_dir / "adapter_model.pt", map_location=map_location)
     load_result = module.load_state_dict(state, strict=False)
