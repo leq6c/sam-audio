@@ -10,10 +10,15 @@ import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
 from torch.nn.utils.rnn import pad_sequence
-from torchcodec.decoders import AudioDecoder, VideoDecoder
 from transformers import AutoTokenizer, BatchFeature
 
 from sam_audio.model.config import SAMAudioConfig, SAMAudioJudgeConfig
+
+try:
+    from torchcodec.decoders import AudioDecoder, VideoDecoder
+except Exception:
+    AudioDecoder = None
+    VideoDecoder = None
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +145,11 @@ def load_video(
             feature_idx_to_wav_idx(torch.arange(size)) / audio_sampling_rate
         )
         if isinstance(video, str):
+            if VideoDecoder is None:
+                raise ImportError(
+                    "torchcodec is required to decode video paths. "
+                    "Install a working torchcodec/ffmpeg stack or pass tensors instead."
+                )
             decoder = VideoDecoder(video, dimension_order="NCHW")
             data = decoder.get_frames_in_range(0, len(decoder))
             diffs = (audio_timestamps[None] - data.pts_seconds[:, None]).abs()
@@ -199,6 +209,13 @@ class Processor:
         videos: List[str | torch.Tensor],
         masks: List[str | torch.Tensor],
     ) -> list[torch.Tensor]:
+        if VideoDecoder is None and any(
+            isinstance(v, str) for v in videos + masks  # type: ignore[operator]
+        ):
+            raise ImportError(
+                "torchcodec is required to decode video paths. "
+                "Install a working torchcodec/ffmpeg stack or pass tensors instead."
+            )
         video = [VideoDecoder(v)[:] if isinstance(v, str) else v for v in videos]
         video_mask = [VideoDecoder(v)[:] if isinstance(v, str) else v for v in masks]
         return [v * m.eq(0) for v, m in zip(video, video_mask, strict=False)]
@@ -292,6 +309,10 @@ class SAMAudioJudgeProcessor(Processor):
         return torch.nn.functional.pad(wav, p1d, mode="reflect")
 
     def _load_audio(self, path: str):
+        if AudioDecoder is None:
+            raise ImportError(
+                "torchcodec is required to decode audio paths in SAMAudioJudgeProcessor."
+            )
         ad = AudioDecoder(path, sample_rate=self.audio_sampling_rate, num_channels=1)
         return ad.get_all_samples().data
 

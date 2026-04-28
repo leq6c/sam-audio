@@ -3,8 +3,17 @@
 from typing import Optional, Tuple
 
 import numpy as np
-from core.audio_visual_encoder.config import TransformerConfig as PEAVTransformerConfig
 from transformers import ModernBertConfig
+
+try:
+    from core.audio_visual_encoder.config import (
+        TransformerConfig as PEAVTransformerConfig,
+    )
+except ImportError:
+    class PEAVTransformerConfig:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
 
 
 class DACVAEConfig:

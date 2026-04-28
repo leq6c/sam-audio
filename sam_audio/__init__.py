@@ -1,4 +1,28 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
 
-from .model import *  # noqa
-from .processor import *  # noqa
+from importlib import import_module
+
+
+_EXPORT_TO_MODULE = {
+    "SAMAudio": ".model.model",
+    "SAMAudioJudgeModel": ".model.judge",
+    "SAMAudioJudgeOutput": ".model.judge",
+    "Batch": ".processor",
+    "SAMAudioProcessor": ".processor",
+    "SAMAudioJudgeProcessor": ".processor",
+}
+
+__all__ = list(_EXPORT_TO_MODULE)
+
+
+def __getattr__(name):
+    if name not in _EXPORT_TO_MODULE:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(_EXPORT_TO_MODULE[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(list(globals()) + __all__)
